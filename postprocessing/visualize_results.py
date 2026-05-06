@@ -40,6 +40,7 @@ if vp3d_path not in sys.path:
     sys.path.insert(0, vp3d_path)
 
 from core import load_poses, load_eldersim_camera
+from postprocessing.evaluate_calibration import reproject_points
 
 # ── squelette OpenPose-25 ─────────────────────────────────────────────────────
 OPENPOSE_SKELETON = (
@@ -200,17 +201,54 @@ def draw_camera(ax, R_w2c, t_w2c, color, label, scale=0.15):
     ax.text(C_plot[0], C_plot[1], C_plot[2] + 0.1, f"  {label}", color=color, fontsize=9, fontweight="bold", ha='center')
 
 
-def make_animation(X3d_world, R_w2c, t_w2c, output_path, fps=15, step=1):
+def make_animation(X3d_world, R_w2c, t_w2c, output_path, fps=15, step=1,
+                   floor_at_zero=False, K=None, p2d_all=None, s2d_all=None,
+                   conf_threshold=0.5):
     """
     Génère un GIF/MP4 animé avec le squelette triangulé + les caméras.
+
+    floor_at_zero: when True, clamps the vertical-axis lower bound to 0
+    (used for the FINAL oriented+scaled viz where the calibration places
+    feet at y=0 in world space).
+
+    K, p2d_all, s2d_all, conf_threshold: optional. When provided, live
+    reprojection-error metrics are overlaid (mean MRE, per-camera MRE,
+    and per-frame Cams/Joints/MRE card).
     """
-    N = X3d_world.shape[0]
+    N, J, _ = X3d_world.shape
     frames_to_render = list(range(0, N, step))
 
     cam_positions = np.array([(-R.T @ t.reshape(3, 1)).flatten() for R, t in zip(R_w2c, t_w2c)])
 
+    # ── Pre-compute reprojection metrics (once) ──────────────────────────────
+    metrics_enabled = K is not None and p2d_all is not None and s2d_all is not None
+    global_mre = float('nan')
+    per_cam_mre = None
+    frame_n_cams = None
+    frame_n_joints = None
+    frame_mre = None
+    if metrics_enabled:
+        K_arr = np.array(K)
+        p2d_reproj = reproject_points(X3d_world, K_arr, R_w2c, t_w2c)  # (C, N, J, 2)
+        err_tensor = np.linalg.norm(p2d_reproj - p2d_all, axis=-1)  # (C, N, J)
+        valid_tensor = (s2d_all > conf_threshold) & ~np.isnan(err_tensor)
+        C_metrics = err_tensor.shape[0]
+
+        per_cam_mre = np.array([
+            float(np.mean(err_tensor[c][valid_tensor[c]])) if valid_tensor[c].any() else float('nan')
+            for c in range(C_metrics)
+        ])
+        all_valid = err_tensor[valid_tensor]
+        global_mre = float(np.mean(all_valid)) if len(all_valid) else float('nan')
+
+        frame_n_cams = valid_tensor.any(axis=2).sum(axis=0).astype(int)
+        frame_n_joints = (~np.isnan(X3d_world).any(axis=2)).sum(axis=1).astype(int)
+        with np.errstate(invalid='ignore', all='ignore'):
+            errs_per_frame = np.where(valid_tensor, err_tensor, np.nan)
+            frame_mre = np.nanmean(errs_per_frame.reshape(C_metrics, N, -1), axis=(0, 2))
+
     valid = X3d_world[~np.isnan(X3d_world).any(axis=-1)].reshape(-1, 3)
-    
+
     # Bounding box pour le squelette (robuste au bruit via les percentiles)
     if len(valid) > 0:
         valid_plot = np.copy(valid)
@@ -222,7 +260,7 @@ def make_animation(X3d_world, R_w2c, t_w2c, output_path, fps=15, step=1):
     else:
         skel_min = np.array([np.inf, np.inf, np.inf])
         skel_max = np.array([-np.inf, -np.inf, -np.inf])
-        
+
     # Bounding box pour les caméras (inclusions strictes avec min/max)
     cam_plot = np.copy(cam_positions)
     cam_plot[:, 0] = cam_positions[:, 0]
@@ -231,23 +269,52 @@ def make_animation(X3d_world, R_w2c, t_w2c, output_path, fps=15, step=1):
     cam_min = np.min(cam_plot, axis=0)
     cam_max = np.max(cam_plot, axis=0)
 
-    pad = 0.2  # Marge réduite pour maximiser le zoom
+    pad = 0.1
     xmin, ymin, zmin = np.minimum(skel_min, cam_min) - pad
     xmax, ymax, zmax = np.maximum(skel_max, cam_max) + pad
-    
-    max_range = max(xmax - xmin, ymax - ymin, zmax - zmin) / 2
-    cx, cy, cz = (xmin+xmax)/2, (ymin+ymax)/2, (zmin+zmax)/2
+    if floor_at_zero:
+        zmin = 0.0  # Feet at y=0 by construction; never plot the floor in the negative half.
 
     cam_colors = ["#2196F3", "#E91E63", "#4CAF50", "#FF9800",
                   "#9C27B0", "#00BCD4", "#FFEB3B", "#795548"]
     n_cams = len(R_w2c)
-    scale = max_range * 0.18
+    # Camera marker size scales with the largest world extent.
+    scale = max(xmax - xmin, ymax - ymin, zmax - zmin) * 0.06
 
-    fig = plt.figure(figsize=(12, 10), facecolor="#1a1a2e")
+    BG_COLOR     = "#FAFAFA"
+    FLOOR_COLOR  = "#7A7A7A"
+    SIDE_PANE    = "#F0F0F0"
+    POINT_COLOR  = "#1a1a1a"
+    TEXT_COLOR   = "#222222"
+    TICK_COLOR   = "#555555"
+
+    # Approximate the projected 2D aspect ratio of the 3D scene at the chosen
+    # view angle so the figure isn't a square wasting white space when the
+    # scene is rectangular (typical with cameras spread around a small zone).
+    import math as _math
+    _e = _math.radians(20); _a = _math.radians(-60)
+    _dx = xmax - xmin; _dy = ymax - ymin; _dz = zmax - zmin
+    _horiz_proj = abs(_dx * _math.cos(_a)) + abs(_dy * _math.sin(_a))
+    _vert_proj = (abs(_dz * _math.cos(_e))
+                  + (abs(_dx * _math.sin(_a)) + abs(_dy * _math.cos(_a))) * _math.sin(_e))
+    _scene_aspect = _horiz_proj / max(_vert_proj, 1e-6)
+
+    _content_h = 8.0
+    _title_inches = 0.85 if metrics_enabled else 0.3
+    _fig_h = _content_h + _title_inches
+    _fig_w = max(min(_content_h * _scene_aspect, 16.0), 7.0)
+
+    fig = plt.figure(figsize=(_fig_w, _fig_h), facecolor=BG_COLOR)
     ax  = fig.add_subplot(111, projection="3d")
-    fig.subplots_adjust(left=0.0, right=1.0, bottom=0.0, top=0.95) # Supprime les bordures noires inutiles
-    ax.set_facecolor("#1a1a2e")
-    fig.patch.set_facecolor("#1a1a2e")
+    _top = 1.0 - (_title_inches / _fig_h)
+    fig.subplots_adjust(left=0.0, right=1.0, bottom=0.0, top=_top)
+    ax.set_facecolor(BG_COLOR)
+    fig.patch.set_facecolor(BG_COLOR)
+    # Closer 3D camera trims some of matplotlib's interior auto-padding.
+    try:
+        ax.dist = 8.0
+    except Exception:
+        pass
 
     method_labels = {
         "linear_1_0":     "Linear",
@@ -258,22 +325,81 @@ def make_animation(X3d_world, R_w2c, t_w2c, output_path, fps=15, step=1):
     calib_name = os.path.splitext(os.path.basename(output_path))[0].replace("visu_3d_", "")
     method_label = method_labels.get(calib_name, calib_name)
 
+    # Static per-camera MRE line, rendered once below the (dynamic) suptitle.
+    if metrics_enabled and per_cam_mre is not None:
+        per_cam_str = "   ".join(
+            f"Cam{c+1}: {per_cam_mre[c]:.1f} px" if not np.isnan(per_cam_mre[c]) else f"Cam{c+1}:  -- "
+            for c in range(len(per_cam_mre))
+        )
+        # Per-cam line near the bottom of the reserved title strip
+        # (suptitle sits above, plot sits below — both with breathing room).
+        _percam_y = _top + 0.25 * (1.0 - _top)
+        fig.text(0.5, _percam_y, per_cam_str,
+                 color=TEXT_COLOR, fontsize=9, ha='center',
+                 family='monospace')
+
     def draw_frame(fc):
         ax.clear()
-        ax.set_facecolor("#1a1a2e")
-        ax.set_title(f"{method_label}  —  Frame {fc+1}/{N}  —  {n_cams} cameras",
-                     color="white", fontsize=10)
-        
-        # Set labels for X, Z (floor), Y (vertical)
-        ax.set_xlabel("X", color="gray"); ax.set_ylabel("Z", color="gray")
-        ax.set_zlabel("Y (vertical)", color="gray")
-        ax.tick_params(colors="gray")
+        ax.set_facecolor(BG_COLOR)
 
-        ax.set_xlim(cx - max_range, cx + max_range)
-        ax.set_ylim(cy - max_range, cy + max_range)
-        ax.set_zlim(cz - max_range, cz + max_range)
-        
+        if metrics_enabled:
+            suptitle = (f"{method_label}  —  Frame {fc+1}/{N}  —  "
+                        f"Mean MRE: {global_mre:.2f} px")
+            _sup_y = _top + 0.75 * (1.0 - _top)
+            fig.suptitle(suptitle, color=TEXT_COLOR, fontsize=11, y=_sup_y)
+        else:
+            ax.set_title(f"{method_label}  —  Frame {fc+1}/{N}  —  {n_cams} cameras",
+                         color=TEXT_COLOR, fontsize=10)
+
+        # Side panes barely visible; floor pane (zaxis) takes a stronger gray when the
+        # calibration is oriented+scaled so the ground reads as ground. Use the native
+        # zaxis pane rather than plot_surface — the pane is rendered behind the scene
+        # by matplotlib's depth sort, while a translucent surface ends up overlaid on
+        # top of the skeleton due to a known 3D-zorder issue.
+        ax.xaxis.pane.set_facecolor(SIDE_PANE)
+        ax.xaxis.pane.set_edgecolor(SIDE_PANE)
+        ax.yaxis.pane.set_facecolor(SIDE_PANE)
+        ax.yaxis.pane.set_edgecolor(SIDE_PANE)
+        floor_color = FLOOR_COLOR if floor_at_zero else SIDE_PANE
+        ax.zaxis.pane.set_facecolor(floor_color)
+        ax.zaxis.pane.set_edgecolor(floor_color)
+
+        ax.set_xlabel("X", color=TEXT_COLOR); ax.set_ylabel("Z", color=TEXT_COLOR)
+        ax.set_zlabel("Y (vertical)", color=TEXT_COLOR)
+        ax.tick_params(colors=TICK_COLOR)
+
+        # Independent per-axis limits: the previous cubic [cx ± max_range]
+        # left a lot of empty space whenever cameras and skeleton spanned
+        # different ranges along each axis. set_box_aspect keeps proportions
+        # visually correct without forcing a cube.
+        ax.set_xlim(xmin, xmax)
+        ax.set_ylim(ymin, ymax)
+        ax.set_zlim(zmin, zmax)
+        ax.set_box_aspect((xmax - xmin, ymax - ymin, zmax - zmin))
+
         ax.view_init(elev=20, azim=-60)
+
+        # Per-frame metrics card (top-left in axes-relative coords).
+        if metrics_enabled:
+            fmre = frame_mre[fc] if frame_mre is not None else float('nan')
+            mre_color = (
+                "#1B5E20" if (not np.isnan(fmre) and fmre < 5)
+                else "#E65100" if (not np.isnan(fmre) and fmre < 10)
+                else "#B71C1C" if not np.isnan(fmre)
+                else TEXT_COLOR
+            )
+            mre_str = f"{fmre:.1f} px" if not np.isnan(fmre) else "  -- "
+            card = (f"Cams      : {frame_n_cams[fc]}/{n_cams}\n"
+                    f"Joints    : {frame_n_joints[fc]}/{J}\n"
+                    f"Frame MRE : {mre_str}")
+            ax.text2D(0.02, 0.92, card, transform=ax.transAxes,
+                      family='monospace', fontsize=9, color=TEXT_COLOR,
+                      verticalalignment='top', horizontalalignment='left',
+                      bbox=dict(facecolor='white', alpha=0.85,
+                                edgecolor='#cccccc', boxstyle='round,pad=0.4'))
+            # Dot to color-code the frame MRE next to its value.
+            ax.text2D(0.155, 0.858, "●", transform=ax.transAxes,
+                      fontsize=12, color=mre_color, verticalalignment='top')
 
         pts = X3d_world[fc]
         pts_plot = np.copy(pts)
@@ -283,7 +409,7 @@ def make_animation(X3d_world, R_w2c, t_w2c, output_path, fps=15, step=1):
 
         valid_mask = ~np.isnan(pts_plot).any(axis=1)
         ax.scatter(pts_plot[valid_mask, 0], pts_plot[valid_mask, 1], pts_plot[valid_mask, 2],
-                   c="white", s=30, zorder=5, depthshade=False) # Points plus gros
+                   c=POINT_COLOR, s=8, zorder=5, depthshade=False)
         skeleton = (METRABS_SKELETON if X3d_world.shape[1] == 26
                     else OPENPOSE_SKELETON)
         if X3d_world.shape[1] == 87:
@@ -410,7 +536,10 @@ def main():
     make_animation(X3d_world, R_w2c, t_w2c,
                    output_path=args.output,
                    fps=args.fps,
-                   step=step)
+                   step=step,
+                   floor_at_zero=args.calib.endswith("_oriented_scaled"),
+                   K=K, p2d_all=p2d_all, s2d_all=s2d_all,
+                   conf_threshold=args.conf_threshold)
 
 
 if __name__ == "__main__":

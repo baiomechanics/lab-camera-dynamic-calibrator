@@ -307,6 +307,10 @@ bash scripts/calibrate.sh <video_dir> <calib_toml> <output_dir> [options]
 | `--frame_skip <n>` | `10` | Frame subsampling interval for Bundle Adjustment |
 | `--conf_threshold <t>` | `0.5` | Minimum keypoint confidence (lower = more data, more noise) |
 | `--save_video` | off | Save 2D pose overlay video (RTMPose only) |
+| `--ref_cam <id>` | *(auto)* | 1-indexed CAM ID forced as Procrustes reference. Default: auto-select the camera with the lowest mean Procrustes residual. |
+| `--no_auto_outlier_drop` | off | Disable the per-camera outlier-frame drop step between linear and BA. |
+| `--outlier_abs_px <p>` | `50` | Absolute reprojection threshold for the outlier drop. |
+| `--outlier_x_median <m>` | `5` | Multiplier above per-camera median for the outlier drop. A frame is dropped when its mean reproj error exceeds **both** thresholds. |
 | `cuda` / `cpu` | `cuda` | Inference device |
 | `lightweight` / `balanced` / `performance` | `balanced` | RTMPose model size |
 
@@ -342,7 +346,9 @@ rm -rf output/my_session/noise_1_0/2d_joint output/my_session/noise_1_0/3d_joint
 **Linear calibration** (`calibration/calib_linear.py` orchestrated by `scripts/run_calib_linear.py`) computes initial extrinsic parameters. The approach differs significantly depending on the pose engine:
 
 **With MeTRAbs — Procrustes alignment:**
-Since MeTRAbs gives a metric 3D skeleton per camera, we can directly align skeletons between cameras using [Procrustes analysis](https://en.wikipedia.org/wiki/Procrustes_analysis) (Umeyama method). Camera 0 defines the world frame; for each other camera, the algorithm finds R, t, s that align its 3D skeleton to camera 0's. This produces a strong initialization because the per-camera 3D is already in metric scale — the Procrustes residual is typically a few mm. Triggered automatically when 26 joints are detected.
+Since MeTRAbs gives a metric 3D skeleton per camera, we can directly align skeletons between cameras using [Procrustes analysis](https://en.wikipedia.org/wiki/Procrustes_analysis) (Umeyama method). One camera defines the world frame; for each other camera, the algorithm finds R, t, s that align its 3D skeleton to the reference. The per-camera 3D is already in metric scale, so the Procrustes residual is typically a few mm and gives a strong starting point for BA. Triggered automatically for the 26-joint and 87-joint MeTRAbs skeletons. The 87-joint skeleton uses a remapped subset of the 27 "real" bones (`METRABS_BONE` mapped onto 87-joint indices) — the ~60 virtual joints in `bml_movi_87` are linear combinations of the 26 main joints inside MeTRAbs' regression head and would otherwise produce rank-deficient orientation constraints.
+
+**Auto reference-camera selection:** by default the reference is **picked automatically** by trying every camera as candidate and keeping the one that minimises the mean Procrustes residual across the other (C-1) alignments. The reference camera's noise propagates to all relative R/t estimates, so a clean view (good angle on the subject, low joint occlusion) yields a markedly better init. Override with `--ref_cam <CAM_ID>` if you want to pin a specific camera. The cost of auto-selection is negligible (just C extra Procrustes alignments, no triangulation).
 
 **With RTMPose — Collinearity constraints:**
 Uses bone orientation collinearity and coplanarity constraints from 2D projections (original method from the paper). This requires solving a larger linear system and doesn't benefit from metric 3D data, so the initial MRE is much higher.
@@ -354,6 +360,17 @@ Uses bone orientation collinearity and coplanarity constraints from 2D projectio
 - The chunk with the **lowest MRE** is selected as the final linear calibration result
 
 **Visibility filter**: within each chunk, only frames where the person is visible from >= 2/3 of cameras (rounded up) are used. Falls back to >= 2 cameras if too few frames pass the stricter threshold.
+
+### Auto Outlier-Frame Drop (between linear and BA)
+
+After the linear init, `scripts/detect_outlier_frames.py` runs once to flag per-camera outlier frames whose mean reprojection error exceeds **both** an absolute threshold (`--outlier_abs_px`, default 50 px) **and** a relative one (`--outlier_x_median * median`, default 5×). Typical targets: half-image / encoding-corrupted frames where MeTRAbs still produces a plausible-looking detection that conf-threshold filters can't reject.
+
+For each affected camera the script:
+1. Appends the absolute frame indices to the per-video sidecar `<video>.dropped.json` (creating it if needed; pre-existing entries are preserved).
+2. Zeros the `score` and `pose` fields of those frames in the saved 2D/3D JSONs in-place, so an immediate re-run of the linear calibration sees them as drops without re-extracting MeTRAbs poses.
+3. The linear calibration is automatically re-run on the cleaned data before BA proceeds (one extra pass, no additional pose extraction).
+
+Disable with `--no_auto_outlier_drop`. The sidecars also feed the next MeTRAbs extraction (see *MeTRAbs Sidecars* below), making the drops persistent across re-runs.
 
 ### Bundle Adjustment
 
@@ -385,6 +402,14 @@ The MeTRAbs inference applies several quality filters before saving keypoints:
 | Out-of-bounds joints | < 10px from image edge | 2D confidence reduced to × 0.1 |
 
 The 3D confidence (`s3d`) uses the bounding box confidence only (not affected by OOB penalty), since MeTRAbs predicts full-body 3D even when 2D joints are clipped at the image edge.
+
+**MeTRAbs sidecars (`<video>.dropped.json`)**: alongside each input video, an optional JSON sidecar may list frame indices that should be treated as drops by every step of the pipeline:
+
+```json
+{ "dropped_frame_indices": [1273, 1274, 1825] }
+```
+
+These indices are honored authoritatively by MeTRAbs (the matching frames get `score=0` in the saved 2D/3D JSONs) and by the calibration / BA / evaluation steps (zero confidence ⇒ ignored). The sidecar is the persistent record produced by the auto outlier-frame drop step; you can also hand-edit it to flag known black/encoded-corrupted frames before the first MeTRAbs run. Indices are absolute video frame numbers.
 
 After filtering, a **Savitzky-Golay temporal smoothing** is applied to both 2D and 3D trajectories, reducing frame-to-frame jitter while preserving motion dynamics. Only frames with valid detections are smoothed.
 
@@ -466,6 +491,8 @@ lab-camera-dynamic-calibrator/
 ├── scripts/                  # Pipeline orchestration (entry points)
 │   ├── calibrate.sh          # Main bash orchestrator (handles conda env switching)
 │   ├── run_calib_linear.py   # Chunked linear calibration + best-chunk selection
+│   ├── detect_outlier_frames.py  # Per-camera reproj-outlier detection
+│   │                         #   (writes <video>.dropped.json sidecars + zeros JSON scores)
 │   ├── run_ba.py             # Bundle Adjustment runner with OOM auto-retry
 │   └── setup_models.sh       # VideoPose3D model download (wget + git)
 │
@@ -517,8 +544,10 @@ lab-camera-dynamic-calibrator/
 | `No valid orientations` | Too few visible frames | Lower `--conf_threshold` or use a different frame range where person is more visible. |
 | MeTRAbs import error | Wrong conda env | MeTRAbs runs in `metrabs_opensim` env; `calibrate.sh` handles this via `conda run -n metrabs_opensim`. |
 | OOM during BA | Too many frames | `run_ba.py` auto-retries with `frame_skip += 5` (up to max 60) to reduce memory usage. |
-| Poses not re-extracted | Cache hit | Delete `output/*/noise_1_0/2d_joint` and `3d_joint` to force re-extraction. |
+| Poses not re-extracted | Cache hit | Delete `output/*/noise_1_0/2d_joint` and `3d_joint` to force re-extraction (the cache only checks frame range, not intrinsics). |
 | Same intrinsics work better than individual ones | Poor per-camera calibration | If cameras are the same model, try shared intrinsics as baseline. |
+| One camera much higher MRE than others | Wrong intrinsics for that camera | Look at its Procrustes residual in the linear log — if it's low (≤ 100 mm) but its MRE is high, the K matrix (focal/principal point) is the bottleneck. The auto reference-camera selection avoids using a problematic camera as world frame. |
+| Half-image / corrupted frames inflate MRE | Encoding artifacts | Auto outlier-frame drop catches these; sidecar `<video>.dropped.json` files are written automatically. To pre-flag known frames, hand-edit the sidecar before the first run. |
 
 ---
 
