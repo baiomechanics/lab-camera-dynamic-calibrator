@@ -29,7 +29,7 @@ The pipeline processes synchronized multi-camera videos through a 7-step pipelin
 | **2. Intrinsics Loading** | `create_cameras_from_toml.py` | Parse camera matrices & distortion from a Pose2Sim-compatible TOML |
 | **3. Configuration** | *(inline in calibrate.sh)* | Auto-detect number of cameras, joints, frame count; write `config.yaml` |
 | **4. 3D Lifting** | `pose/inference.py` | Lift 2D→3D with VideoPose3D *(skipped when using MeTRAbs — 3D is already available)* |
-| **5. Calibration** | `scripts/run_calib_linear.py` → `calibration/calib_linear.py` → `scripts/run_ba.py` → `calibration/ba.py` | Chunked linear calibration (with Procrustes init for MeTRAbs) + Bundle Adjustment |
+| **5. Calibration** | `scripts/run_calib_linear.py` → `calibration/calib_linear.py` → `scripts/detect_outlier_frames.py` → `scripts/run_ba.py` → `calibration/ba.py` | Chunked linear init (Procrustes for MeTRAbs, auto reference-camera selection) → auto outlier-frame drop → linear re-run if any drops → Bundle Adjustment |
 | **6. Evaluation** | `evaluate_calibration.py` | Compute Mean Reprojection Error (MRE) per camera + visualizations |
 | **7. Scaling** | `scale_scene.py` | Orient scene (gravity-aligned) and scale to metric units using person height |
 
@@ -47,13 +47,9 @@ Two pose estimation backends are supported, with fundamentally different archite
 
 **Why this matters for calibration:** since each camera produces its own 3D skeleton in metric scale, we can use **Procrustes alignment** to find the relative rotation and translation between cameras directly from their 3D predictions — without needing an intermediate triangulation step. This gives a much better initialization for bundle adjustment compared to 2D-only methods.
 
-We use the **`bml_movi_87`** skeleton (87 joints from the [BML MoVi](https://www.biomotionlab.ca/movi/) dataset). The full 87-joint 2D and 3D predictions are stored for each camera, and a **26-joint calibration subset** is extracted for the calibration pipeline:
+We use the **`bml_movi_87`** skeleton (87 joints from the [BML MoVi](https://www.biomotionlab.ca/movi/) dataset). The full 87-joint 2D and 3D predictions flow through the entire calibration pipeline. For bone-length regularization in Bundle Adjustment, we use a **27-bone skeleton** built from the 26 "real" joints (head, thorax, pelvis, shoulders, elbows, wrists, hands, hips, knees, ankles, feet, heels, toes, backneck, sternum) — the other ~60 joints in `bml_movi_87` are virtual landmarks (clavicle, sternum sides, lbreast, lfirstmetatarsal, etc.) that MeTRAbs constructs as linear combinations of the 26 main joints; treating them as independent bone sources would be redundant and would make the system rank-deficient.
 
-- **20 virtual joint centers** (head, thorax, pelvis, hips, shoulders, elbows, wrists, hands, knees, ankles, feet)
-- **2 anatomical landmarks** (backneck, sternum)
-- **4 foot markers** (left/right heel, left/right toe)
-
-These 26 joints are connected by **27 bones** covering the full body including a 4-segment spine and articulated feet — significantly richer than OpenPose's 12 bones. The mapping from `bml_movi_87` to our 26-joint format is defined in `util.py` (`METRABS_BML87_INDICES`). Additionally, a **Halpe26 conversion** is generated for backward compatibility with the scaling step.
+These **27 bones** cover the full body including a 4-segment spine and articulated feet — significantly richer than OpenPose's 12 bones. The mapping from `bml_movi_87` to the 26-joint subset is defined in `core/skeletons.py` (`METRABS_BML87_INDICES`), and the bone topology in `METRABS_BONE` is remapped onto the 87-joint indices at runtime by `get_bone_config(87)`. A **Halpe26 conversion** of the 2D detections is also generated for backward compatibility with the scaling step.
 
 **Temporal smoothing:** a Savitzky-Golay filter is applied to both 2D and 3D trajectories to reduce frame-to-frame jitter on valid detections.
 
@@ -61,7 +57,7 @@ These 26 joints are connected by **27 bones** covering the full body including a
 |----------|-------|
 | Model | `metrabs_l` (EffNetV2-L backbone) via TensorFlow Hub |
 | Input skeleton | `bml_movi_87` (87 joints) |
-| Stored output | Full 87-joint 2D + 3D, 26-joint calib subset, Halpe26 2D |
+| Stored output | Full 87-joint 2D + 3D, Halpe26 2D (for scaling) |
 | 3D output | Metric (millimeters), per-camera coordinate frame |
 | Architecture | Single-step: image → 2D + 3D simultaneously |
 | Conda env | `metrabs_opensim` (Python 3.10, TensorFlow 2.x) |
@@ -454,7 +450,7 @@ After filtering, a **Savitzky-Golay temporal smoothing** is applied to both 2D a
     ltoe(24)                 rtoe(25)
 ```
 
-The 26 joints are extracted from `bml_movi_87` using indices defined in `METRABS_BML87_INDICES` (see `util.py` line 195).
+The 26 joints are extracted from `bml_movi_87` using `METRABS_BML87_INDICES` (defined in `core/skeletons.py`).
 
 **RTMPose / OpenPose-25** (25 joints, 12 bones):
 Standard OpenPose body-25 format with joints: Nose, Neck, RShoulder, RElbow, RWrist, LShoulder, LElbow, LWrist, MidHip, RHip, RKnee, RAnkle, LHip, LKnee, LAnkle, REye, LEye, REar, LEar, LBigToe, LSmallToe, LHeel, RBigToe, RSmallToe, RHeel.
